@@ -1076,3 +1076,100 @@ func TestSimulatorIntegration_IncrementalPreemption(t *testing.T) {
 		})
 	}
 }
+
+func TestSimulatorIntegration_IncrementalVirtualPodGroupScheduling(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-inc-virtual-pg", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	client := testCtx.ClientSet
+	ns := testCtx.NS.Name
+
+	cfg := newKubeSchedulerConfig(withTopologyPlacementGenerator)
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	cs, err := sim.NewClusterState(ctx)
+	if err != nil {
+		t.Fatalf("NewClusterState failed: %v", err)
+	}
+
+	nodeA := st.MakeNode().Name("node-a").Label(zoneLabel, "zone-a").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	nodeB := st.MakeNode().Name("node-b").Label(zoneLabel, "zone-b").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "8",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	fillerB := makeScheduledPod(ns, "filler-b", "node-b", "", "6")
+
+	cs.Cache.AddNode(logger, nodeA)
+	cs.Cache.AddNode(logger, nodeB)
+	if err := cs.Cache.AddPod(logger, fillerB); err != nil {
+		t.Fatalf("AddPod(fillerB) failed: %v", err)
+	}
+
+	snap := cs.GetAssociatedSnapshot()
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+
+	tasBasicPG := st.MakePodGroup().Name("virtual-tas-pg").Namespace(ns).BasicPolicy().TopologyKey(zoneLabel).Obj()
+	if err := snap.AddPodGroup(ctx, tasBasicPG); err != nil {
+		t.Fatalf("AddPodGroup failed: %v", err)
+	}
+
+	// Call 1 schedules virtual pod-1 onto node-a (zone-a) because filler-b occupies 6/8 CPU on node-b.
+	vPod1 := makePod(ns, "v-pod-1", "virtual-tas-pg", "2")
+	res1 := snap.ScheduleWorkload(ctx, []*v1.Pod{vPod1}, snapshot.NewScheduleWorkloadOptions(false))
+	if !res1.Status.IsSuccess() || len(res1.PodResults) != 1 || res1.PodResults[0].SelectedNodeName != "node-a" {
+		t.Fatalf("Call 1 expected v-pod-1 on node-a, got status=%v results=%+v", res1.Status, res1.PodResults)
+	}
+
+	// Preempt filler-b so node-b now has 8 CPU free while node-a only has 2 CPU free.
+	if _, err := snap.PreemptPods(ctx, []*v1.Pod{fillerB}); err != nil {
+		t.Fatalf("PreemptPods(fillerB) failed: %v", err)
+	}
+
+	// Call 2 schedules virtual pod-2: TopologyPlacementGenerator must observe v-pod-1 in ScheduledPods() and pin v-pod-2 to zone-a (node-a).
+	vPod2 := makePod(ns, "v-pod-2", "virtual-tas-pg", "2")
+	res2 := snap.ScheduleWorkload(ctx, []*v1.Pod{vPod2}, snapshot.NewScheduleWorkloadOptions(false))
+	if !res2.Status.IsSuccess() || len(res2.PodResults) != 1 || res2.PodResults[0].SelectedNodeName != "node-a" {
+		t.Fatalf("Call 2 expected v-pod-2 pinned to node-a, got status=%v results=%+v", res2.Status, res2.PodResults)
+	}
+
+	// Call 3 schedules virtual pod-3: zone-a is full (4/4 CPU), so TAS must reject zone-b.
+	vPod3 := makePod(ns, "v-pod-3", "virtual-tas-pg", "2")
+	res3 := snap.ScheduleWorkload(ctx, []*v1.Pod{vPod3}, snapshot.NewScheduleWorkloadOptions(false))
+	if res3.Status.IsSuccess() {
+		t.Fatalf("Call 3 expected Unschedulable when pinned zone-a is full, got Success")
+	}
+
+	// SyncSnapshot reverts virtual PodGroup and virtual pods cleanly.
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+	if resAfterSync := snap.ScheduleWorkload(ctx, []*v1.Pod{vPod1}, snapshot.NewScheduleWorkloadOptions(true)); !resAfterSync.Status.IsError() {
+		t.Fatalf("expected error after SyncSnapshot reverted virtual-tas-pg, got %v", resAfterSync.Status)
+	}
+}

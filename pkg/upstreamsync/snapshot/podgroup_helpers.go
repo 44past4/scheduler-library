@@ -15,8 +15,10 @@
 package snapshot
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
+	"slices"
 
 	"github.com/google/uuid"
 	v1 "k8s.io/api/core/v1"
@@ -238,5 +240,90 @@ func buildHierarchy(
 		}
 	}
 
+	if root != nil && root.Type == fwk.CompositePodGroupKeyType {
+		visited := sets.New[fwk.EntityKey]()
+		if err := populateRegisteredSubtreeChildren(snapshot, namespace, root, treeNodes, visited); err != nil {
+			return nil, err
+		}
+	}
+
 	return root, nil
+}
+
+// populateRegisteredSubtreeChildren expands a CompositePodGroup subtree with any sibling PodGroups
+// or CompositePodGroups already registered in snapshot.CompositePodGroupStates() that had no
+// unscheduled pods in the input slice (for example, groups whose pods were scheduled in an earlier call).
+func populateRegisteredSubtreeChildren(
+	snapshot *cache.Snapshot,
+	namespace string,
+	cpgInfo *framework.PodGroupInfo,
+	treeNodes map[fwk.EntityKey]*framework.PodGroupInfo,
+	visited sets.Set[fwk.EntityKey],
+) error {
+	cpgKey := fwk.CompositePodGroupKey(namespace, cpgInfo.Name)
+	if visited.Has(cpgKey) {
+		return fmt.Errorf("cycle detected in composite pod group hierarchy at %s/%s", namespace, cpgInfo.Name)
+	}
+	visited.Insert(cpgKey)
+
+	for _, existingChild := range cpgInfo.Children {
+		if existingChild.Type == fwk.CompositePodGroupKeyType {
+			if err := populateRegisteredSubtreeChildren(snapshot, namespace, existingChild, treeNodes, visited); err != nil {
+				return err
+			}
+		}
+	}
+
+	if snapshot == nil {
+		return nil
+	}
+	cpgState, err := snapshot.CompositePodGroupStates().Get(namespace, cpgInfo.Name)
+	if err != nil || cpgState == nil {
+		return nil
+	}
+
+	children := slices.Clone(cpgState.GetChildren())
+	slices.SortFunc(children, func(a, b fwk.EntityKey) int {
+		return cmp.Compare(a.String(), b.String())
+	})
+
+	for _, childKey := range children {
+		if _, exists := treeNodes[childKey]; exists {
+			continue
+		}
+		switch childKey.Type {
+		case fwk.PodGroupKeyType:
+			pg, err := snapshot.PodGroups().Get(childKey.Namespace, childKey.Name)
+			if err != nil || pg == nil {
+				continue
+			}
+			childInfo := &framework.PodGroupInfo{
+				Namespace: childKey.Namespace,
+				Name:      childKey.Name,
+				Type:      fwk.PodGroupKeyType,
+				PodGroup:  pg,
+				Children:  make([]*framework.PodGroupInfo, 0),
+			}
+			treeNodes[childKey] = childInfo
+			cpgInfo.Children = append(cpgInfo.Children, childInfo)
+		case fwk.CompositePodGroupKeyType:
+			cpg, err := snapshot.CompositePodGroups().Get(childKey.Namespace, childKey.Name)
+			if err != nil || cpg == nil {
+				continue
+			}
+			childInfo := &framework.PodGroupInfo{
+				Namespace:         childKey.Namespace,
+				Name:              childKey.Name,
+				Type:              fwk.CompositePodGroupKeyType,
+				CompositePodGroup: cpg,
+				Children:          make([]*framework.PodGroupInfo, 0),
+			}
+			treeNodes[childKey] = childInfo
+			cpgInfo.Children = append(cpgInfo.Children, childInfo)
+			if err := populateRegisteredSubtreeChildren(snapshot, namespace, childInfo, treeNodes, visited); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

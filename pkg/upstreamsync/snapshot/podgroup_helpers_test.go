@@ -217,6 +217,18 @@ func TestBuildPodGroupHierarchy(t *testing.T) {
 			wantErr:            false,
 		},
 		{
+			name: "multi-level hierarchy includes sibling pod groups and composite pod groups without unscheduled pods",
+			pods: []*v1.Pod{
+				cpg1Leaf1Pod1,
+			},
+			podGroups:          []*schedulingv1beta1.PodGroup{cpg1Leaf1, cpg1Leaf2, cpg2Leaf1, cpg2Leaf2},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			wantRootName:       "root-cpg",
+			wantType:           fwk.CompositePodGroupKeyType,
+			wantChildren:       2,
+			wantErr:            false,
+		},
+		{
 			name:    "empty pod list error",
 			wantErr: true,
 		},

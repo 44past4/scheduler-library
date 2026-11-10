@@ -23,9 +23,12 @@ import (
 	"reflect"
 	"slices"
 
+	"github.com/google/uuid"
 	v1 "k8s.io/api/core/v1"
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
@@ -174,8 +177,23 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get framework: %w", err)
 	}
+	evalPod := pod
+	if isPodGroupMember(evalPod) {
+		if evalPod.UID == "" || evalPod.Namespace == "" {
+			evalPod = evalPod.DeepCopy()
+			if evalPod.UID == "" {
+				evalPod.UID = types.UID(uuid.New().String())
+			}
+			if evalPod.Namespace == "" {
+				evalPod.Namespace = metav1.NamespaceDefault
+			}
+		}
+		if untrack := s.registerVirtualPodGroupMember(evalPod); untrack != nil {
+			defer untrack()
+		}
+	}
 	state := framework.NewCycleState()
-	podInfo, err := framework.NewPodInfo(pod)
+	podInfo, err := framework.NewPodInfo(evalPod)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create pod info: %w", err)
 	}
@@ -290,11 +308,25 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
 	for pod := range pods {
+		var untrackPodGroupMember func()
+		if isPodGroupMember(pod) {
+			if pod.UID == "" {
+				pod.UID = types.UID(uuid.New().String())
+			}
+			if pod.Namespace == "" {
+				pod.Namespace = metav1.NamespaceDefault
+			}
+			untrackPodGroupMember = s.registerVirtualPodGroupMember(pod)
+		}
+
 		sched := upstreamsync.NewScheduler(s.schedulerSnapshot, currentCycle, 0, 1, nil)
 
 		res, revertFn, err := scheduleOnePod(ctx, s.profiles, sched, pod)
 
 		if err != nil {
+			if untrackPodGroupMember != nil {
+				untrackPodGroupMember()
+			}
 			return result, err
 		}
 
@@ -303,11 +335,14 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 			// scheduleOnePod, but it is returned in the result object. To make the result placement
 			// visible to the caller, pod.Spec.NodeName needs to be set.
 			pod.Spec.NodeName = res.GetNodeName()
+			// Register untrackPodGroupMember before revertFn so LIFO rollback runs ForgetPod first
+			// and removes the virtual pod from podGroupStates second.
+			s.undoLog.registerOperation(untrackPodGroupMember)
+			s.undoLog.registerOperation(revertFn)
+		} else if untrackPodGroupMember != nil {
+			untrackPodGroupMember()
 		}
 
-		if revertFn != nil {
-			s.undoLog.registerOperation(revertFn)
-		}
 		result = append(result, schedulingResult(res))
 
 		if !res.GetStatus().IsSuccess() {
@@ -463,27 +498,40 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 // profiles should keep the GangScheduling plugin enabled (via MultiPoint or Permit, which registers its
 // PlacementFeasible extension point) for gang and basic quorum enforcement.
 //
-// Note: Virtual pods (input pods not present in the snapshot beforehand) are assumed on nodes,
-// but not added to internal pod group sets (allPods/assumedPods). Consequently,
-// PodGroupState.ScheduledPods() does not include virtual pods from previous ScheduleWorkload calls.
-// This is safe when evaluating an entire virtual workload in a single call (such as Kueue admission).
-// However, when scheduling a hierarchy incrementally across multiple ScheduleWorkload calls, plugins
-// that query ScheduledPods() (such as TAS or gang scheduling) do not observe virtual pods from earlier calls.
+// Virtual pods (input pods not present in the snapshot beforehand) are registered in the snapshot's
+// PodGroupStates as unscheduled members before scheduling begins, transition to AssumedPods /
+// ScheduledPods as placements are assumed, and remain in ScheduledPods when Pass 1 commits with
+// DryRun set to false (or are removed when DryRun is true, when an outcome is non-Success, or when
+// an enclosing Transaction / ResetMutations rolls back).
 func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts ScheduleWorkloadOptions) (result WorkloadSchedulingResult) {
 	if len(pods) == 0 {
 		return WorkloadSchedulingResult{Status: fwk.NewStatus(fwk.Success)}
 	}
+
+	type virtualPodCleanup struct {
+		uid     types.UID
+		untrack func()
+		undone  bool
+	}
+	var virtualCleanups []*virtualPodCleanup
 
 	initialStateVersion := s.undoLog.stateVersion
 
 	defer func() {
 		if !result.Status.IsSuccess() || opts.DryRun {
 			s.undoLog.restoreState(initialStateVersion)
-		}
-		if result.Status.IsSuccess() && !opts.DryRun {
+		} else {
+			scheduledUIDs := sets.New[types.UID]()
 			for _, r := range result.PodResults {
 				if r.SelectedNodeName != "" && r.Pod != nil {
 					r.Pod.Spec.NodeName = r.SelectedNodeName
+					scheduledUIDs.Insert(r.Pod.UID)
+				}
+			}
+			for _, entry := range virtualCleanups {
+				if !scheduledUIDs.Has(entry.uid) && !entry.undone {
+					entry.undone = true
+					entry.untrack()
 				}
 			}
 		}
@@ -500,6 +548,22 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	schedFramework, err := s.profiles.FrameworkForPodGroup(podGroupInfo)
 	if err != nil {
 		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to get framework for pod group: %w", err))}
+	}
+
+	// Register virtual pods in PodGroupStates before Pass 1 so plugins observe them in
+	// UnscheduledPods() across all passes, AssumePod transitions them to ScheduledPods(),
+	// and LIFO undo runs ForgetPod before removing virtual members from PodGroupStates.
+	for _, pod := range pods {
+		if untrack := s.registerVirtualPodGroupMember(pod); untrack != nil {
+			entry := &virtualPodCleanup{uid: pod.UID, untrack: untrack}
+			virtualCleanups = append(virtualCleanups, entry)
+			s.undoLog.registerOperation(func() {
+				if !entry.undone {
+					entry.undone = true
+					entry.untrack()
+				}
+			})
+		}
 	}
 
 	// First, try scheduling without preemption with the nodes occupied by committed victims filtered out.
@@ -793,10 +857,62 @@ func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *sche
 //    snapshot first, pass that existing object to s.schedulerSnapshot.RemoveGenericPodGroup,
 //    and store existing.DeepCopy() in the undo log.
 // 4. Keep the public ClusterSnapshot methods unchanged so callers do not break.
+// 5. Retain writableField, getOrCreatePodGroupState, podGroupEmpty, and
+//    registerVirtualPodGroupMember until upstream cache.Snapshot exposes reversible
+//    virtual pod registration on PodGroupStates.
 
 func writableField(v reflect.Value, name string) reflect.Value {
 	f := v.FieldByName(name)
 	return reflect.NewAt(f.Type(), f.Addr().UnsafePointer()).Elem()
+}
+
+// registerVirtualPodGroupMember registers a virtual pod (one not already tracked in the
+// snapshot's podGroupStates) as an unscheduled member of its PodGroup without advancing
+// podGroupState generation, and returns an undo callback that removes the registration.
+// If GenericWorkload is disabled on the snapshot, the pod does not belong to a PodGroup,
+// or the pod's UID is already tracked in podGroupStates, it returns nil.
+func (s *ClusterSnapshot) registerVirtualPodGroupMember(pod *v1.Pod) func() {
+	if pod == nil || !isPodGroupMember(pod) {
+		return nil
+	}
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+	if !rv.FieldByName("genericWorkloadEnabled").Bool() {
+		return nil
+	}
+	key := fwk.PodGroupKey(pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName)
+	pgs := s.getOrCreatePodGroupState(rv, key)
+	allPods := writableField(pgs.Elem(), "allPods").Interface().(map[types.UID]*v1.Pod)
+	if _, exists := allPods[pod.UID]; exists {
+		return nil
+	}
+
+	// Store a copy with an empty NodeName so in-place Spec.NodeName updates on returned
+	// PodResults do not cause ForgetPod to misclassify a virtual pod as pre-assigned.
+	storedPod := pod.DeepCopy()
+	storedPod.Spec.NodeName = ""
+	allPods[pod.UID] = storedPod
+	writableField(pgs.Elem(), "unscheduledPods").Interface().(sets.Set[types.UID]).Insert(pod.UID)
+
+	uid := pod.UID
+	return func() {
+		snapRV := reflect.ValueOf(s.schedulerSnapshot).Elem()
+		pgsMap := writableField(snapRV, "podGroupStates")
+		if pgsMap.IsNil() {
+			return
+		}
+		keyVal := reflect.ValueOf(key)
+		currPGS := pgsMap.MapIndex(keyVal)
+		if !currPGS.IsValid() {
+			return
+		}
+		delete(writableField(currPGS.Elem(), "allPods").Interface().(map[types.UID]*v1.Pod), uid)
+		writableField(currPGS.Elem(), "unscheduledPods").Interface().(sets.Set[types.UID]).Delete(uid)
+		delete(writableField(currPGS.Elem(), "assumedPods").Interface().(map[types.UID]*v1.Pod), uid)
+		writableField(currPGS.Elem(), "assignedPods").Interface().(sets.Set[types.UID]).Delete(uid)
+		if podGroupEmpty(currPGS) {
+			pgsMap.SetMapIndex(keyVal, reflect.Value{})
+		}
+	}
 }
 
 func (s *ClusterSnapshot) addPodGroup(pg *schedulingv1beta1.PodGroup) error {
