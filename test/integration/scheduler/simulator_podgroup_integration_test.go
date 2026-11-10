@@ -1076,3 +1076,102 @@ func TestSimulatorIntegration_IncrementalPreemption(t *testing.T) {
 		})
 	}
 }
+
+func TestSimulatorIntegration_PreemptPodsUpdatesPodGroupStates(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-preempt-pg-state", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	client := testCtx.ClientSet
+	ns := testCtx.NS.Name
+
+	cfg := newKubeSchedulerConfig(withTopologyPlacementGenerator)
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	cs, err := sim.NewClusterState(ctx)
+	if err != nil {
+		t.Fatalf("NewClusterState failed: %v", err)
+	}
+
+	nodeA := st.MakeNode().Name("node-a").Label(zoneLabel, "zone-a").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "5",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	nodeB := st.MakeNode().Name("node-b").Label(zoneLabel, "zone-b").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	tasPG := st.MakePodGroup().Name("tas-pg").Namespace(ns).BasicPolicy().TopologyKey(zoneLabel).Obj()
+	evictedMember := makeScheduledPod(ns, "member-zone-a", "node-a", "tas-pg", "2")
+	blockerZoneA := makeScheduledPod(ns, "blocker-zone-a", "node-a", "", "3")
+	pendingMember := makePod(ns, "pending-member", "tas-pg", "3")
+
+	cs.Cache.AddNode(logger, nodeA)
+	cs.Cache.AddNode(logger, nodeB)
+	cs.Cache.AddPodGroup(tasPG)
+	for _, p := range []*v1.Pod{evictedMember, blockerZoneA, pendingMember} {
+		if err := cs.Cache.AddPod(logger, p.DeepCopy()); err != nil {
+			t.Fatalf("AddPod(%s) failed: %v", p.Name, err)
+		}
+	}
+
+	snap := cs.GetAssociatedSnapshot()
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+
+	// While member-zone-a is scheduled on node-a (zone-a), zone-a has 0 CPU free so pending-member cannot schedule.
+	if res := snap.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, snapshot.NewScheduleWorkloadOptions(true)); res.Status.IsSuccess() {
+		t.Fatalf("expected Unschedulable before PreemptPods, got Success")
+	}
+
+	// PreemptPods removes member-zone-a from PodGroupStates, allowing pending-member to schedule into zone-b.
+	handle, err := snap.PreemptPods(ctx, []*v1.Pod{evictedMember})
+	if err != nil {
+		t.Fatalf("PreemptPods failed: %v", err)
+	}
+	resAfterPreempt := snap.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, snapshot.NewScheduleWorkloadOptions(true))
+	if !resAfterPreempt.Status.IsSuccess() || len(resAfterPreempt.PodResults) != 1 || resAfterPreempt.PodResults[0].SelectedNodeName != "node-b" {
+		t.Fatalf("expected pending-member to fit on node-b after PreemptPods, got status=%v results=%+v", resAfterPreempt.Status, resAfterPreempt.PodResults)
+	}
+
+	// Unpreempt restores member-zone-a in PodGroupStates.
+	if _, err := snap.Unpreempt(handle); err != nil {
+		t.Fatalf("Unpreempt failed: %v", err)
+	}
+	if resAfterUnpreempt := snap.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, snapshot.NewScheduleWorkloadOptions(true)); resAfterUnpreempt.Status.IsSuccess() {
+		t.Fatalf("expected Unschedulable after Unpreempt, got Success")
+	}
+
+	// Preempt again, then verify SyncSnapshot restores PodGroupStates from ClusterState.Cache cleanly.
+	if _, err := snap.PreemptPods(ctx, []*v1.Pod{evictedMember}); err != nil {
+		t.Fatalf("second PreemptPods failed: %v", err)
+	}
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+	if resAfterSync := snap.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, snapshot.NewScheduleWorkloadOptions(true)); resAfterSync.Status.IsSuccess() {
+		t.Fatalf("expected Unschedulable after SyncSnapshot restored member-zone-a, got Success")
+	}
+}

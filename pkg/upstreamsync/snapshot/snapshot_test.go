@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -2982,4 +2983,211 @@ func TestScheduleWorkload_PreservesPassFailureResults(t *testing.T) {
 			ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New("v-potential")})
 		})
 	}
+}
+
+func assertScheduledPodsInPodGroupState(
+	t *testing.T,
+	snap *cache.Snapshot,
+	namespace, pgName string,
+	wantScheduled map[string]string,
+) {
+	t.Helper()
+	pgState, err := snap.PodGroupStates().Get(namespace, pgName)
+	if err != nil {
+		t.Fatalf("PodGroupStates().Get(%s/%s) unexpected error: %v", namespace, pgName, err)
+	}
+	got := make(map[string]string, len(pgState.ScheduledPods()))
+	for _, p := range pgState.ScheduledPods() {
+		got[p.Name] = p.Spec.NodeName
+	}
+	if diff := cmp.Diff(wantScheduled, got, cmpopts.EquateEmpty()); diff != "" {
+		t.Errorf("PodGroupState(%s/%s).ScheduledPods() mismatch (-want +got):\n%s", namespace, pgName, diff)
+	}
+	if pgState.ScheduledPodsCount() != len(wantScheduled) {
+		t.Errorf("PodGroupState(%s/%s).ScheduledPodsCount() = %d, want %d", namespace, pgName, pgState.ScheduledPodsCount(), len(wantScheduled))
+	}
+}
+
+func TestPreemptPods_PodGroupStates(t *testing.T) {
+	const testZoneLabel = "topology.kubernetes.io/zone"
+
+	t.Run("PreemptPods and Unpreempt update PodGroupState.ScheduledPods observed by TopologyPlacementGenerator", func(t *testing.T) {
+		ctx := t.Context()
+		nodeA := st.MakeNode().Name("node-a").Label(testZoneLabel, "zone-a").Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "5",
+			v1.ResourceMemory: "8Gi",
+			v1.ResourcePods:   "10",
+		}).Obj()
+		nodeB := st.MakeNode().Name("node-b").Label(testZoneLabel, "zone-b").Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "4",
+			v1.ResourceMemory: "8Gi",
+			v1.ResourcePods:   "10",
+		}).Obj()
+
+		tasPG := st.MakePodGroup().Name("tas-pg").Namespace("default").BasicPolicy().TopologyKey(testZoneLabel).Obj()
+		evictedMember := makeScheduledTestPod("member-zone-a", "node-a", "tas-pg", "2")
+		blockerZoneA := makeScheduledTestPod("blocker-zone-a", "node-a", "", "3")
+		pendingMember := testutils.MakePod("pending-member", "tas-pg", "3")
+
+		profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+			ctx,
+			t,
+			[]*v1.Pod{evictedMember, blockerZoneA},
+			[]*v1.Node{nodeA, nodeB},
+			[]*schedulingv1beta1.PodGroup{tasPG},
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+		}
+		cs := New(snap, profileMap)
+
+		// Before preemption, member-zone-a pins tas-pg to zone-a (0 CPU free), so pending-member is Unschedulable.
+		assertScheduledPodsInPodGroupState(t, snap, "default", "tas-pg", map[string]string{"member-zone-a": "node-a"})
+		resBefore := cs.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, ScheduleWorkloadOptions{CommonSchedulingOptions: CommonSchedulingOptions{DryRun: true}})
+		if resBefore.Status.IsSuccess() {
+			t.Fatalf("expected Unschedulable while member-zone-a pins tas-pg to full zone-a, got Success")
+		}
+
+		// Preempt member-zone-a: PodGroupState.ScheduledPods() becomes empty, allowing pending-member to schedule in zone-b (node-b).
+		handle, err := cs.PreemptPods(ctx, []*v1.Pod{evictedMember})
+		if err != nil {
+			t.Fatalf("PreemptPods failed: %v", err)
+		}
+		assertScheduledPodsInPodGroupState(t, snap, "default", "tas-pg", nil)
+
+		resDuring := cs.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, ScheduleWorkloadOptions{CommonSchedulingOptions: CommonSchedulingOptions{DryRun: true}})
+		if !resDuring.Status.IsSuccess() || len(resDuring.PodResults) != 1 || resDuring.PodResults[0].SelectedNodeName != "node-b" {
+			t.Fatalf("expected pending-member to fit on node-b after member-zone-a preemption, got status=%v results=%+v", resDuring.Status, resDuring.PodResults)
+		}
+
+		// Unpreempt restores member-zone-a in PodGroupStates, pinning tas-pg back to zone-a.
+		if _, err := cs.Unpreempt(handle); err != nil {
+			t.Fatalf("Unpreempt failed: %v", err)
+		}
+		assertScheduledPodsInPodGroupState(t, snap, "default", "tas-pg", map[string]string{"member-zone-a": "node-a"})
+		resAfter := cs.ScheduleWorkload(ctx, []*v1.Pod{pendingMember}, ScheduleWorkloadOptions{CommonSchedulingOptions: CommonSchedulingOptions{DryRun: true}})
+		if resAfter.Status.IsSuccess() {
+			t.Fatalf("expected Unschedulable after Unpreempt restored member-zone-a, got Success")
+		}
+	})
+
+	t.Run("Non-LIFO Unpreempt, mid-call failure, and Transaction Revert restore PodGroupStates accurately", func(t *testing.T) {
+		ctx := t.Context()
+		node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "8",
+			v1.ResourceMemory: "8Gi",
+			v1.ResourcePods:   "10",
+		}).Obj()
+		gangPG := testutils.MakeGangPodGroup("gang-pg", "", 2)
+		pod1 := makeScheduledTestPod("pg-pod1", "node1", "gang-pg", "2")
+		pod2 := makeScheduledTestPod("pg-pod2", "node1", "gang-pg", "2")
+		missingPod := makeScheduledTestPod("missing-pod", "node1", "gang-pg", "2")
+
+		profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+			ctx, t, []*v1.Pod{pod1, pod2}, []*v1.Node{node1}, []*schedulingv1beta1.PodGroup{gangPG}, nil,
+		)
+		if err != nil {
+			t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+		}
+		cs := New(snap, profileMap)
+
+		// Mid-call failure on missingPod rolls back pod1 in both NodeInfo and PodGroupStates.
+		if _, err := cs.PreemptPods(ctx, []*v1.Pod{pod1, missingPod}); err == nil {
+			t.Fatalf("expected error preempting missingPod, got nil")
+		}
+		assertScheduledPodsInPodGroupState(t, snap, "default", "gang-pg", map[string]string{
+			"pg-pod1": "node1",
+			"pg-pod2": "node1",
+		})
+
+		// Non-LIFO unpreempt inside a reverted Transaction restores both pods cleanly.
+		if err := cs.Transaction(ctx, func() (TransactionResult, error) {
+			u1, err := cs.PreemptPods(ctx, []*v1.Pod{pod1})
+			if err != nil {
+				t.Fatalf("PreemptPods(pod1) failed: %v", err)
+			}
+			assertScheduledPodsInPodGroupState(t, snap, "default", "gang-pg", map[string]string{"pg-pod2": "node1"})
+
+			u2, err := cs.PreemptPods(ctx, []*v1.Pod{pod2})
+			if err != nil {
+				t.Fatalf("PreemptPods(pod2) failed: %v", err)
+			}
+			assertScheduledPodsInPodGroupState(t, snap, "default", "gang-pg", nil)
+
+			// Out-of-order Unpreempt(u1) while u2 remains preempted.
+			if _, err := cs.Unpreempt(u1); err != nil {
+				t.Fatalf("Unpreempt(u1) failed: %v", err)
+			}
+			assertScheduledPodsInPodGroupState(t, snap, "default", "gang-pg", map[string]string{"pg-pod1": "node1"})
+			_ = u2
+			return Revert, nil
+		}); err != nil {
+			t.Fatalf("Transaction failed: %v", err)
+		}
+
+		assertScheduledPodsInPodGroupState(t, snap, "default", "gang-pg", map[string]string{
+			"pg-pod1": "node1",
+			"pg-pod2": "node1",
+		})
+	})
+
+	t.Run("SchedulePods followed by PreemptPods and ResetMutations restores unscheduled PodGroup member", func(t *testing.T) {
+		ctx := t.Context()
+		node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "4",
+			v1.ResourceMemory: "8Gi",
+			v1.ResourcePods:   "10",
+		}).Obj()
+		pg := testutils.MakeBasicPodGroup("basic-pg", "")
+		unschedPod := testutils.MakePod("unsched-pod", "basic-pg", "2")
+
+		profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+			ctx, t, nil, []*v1.Node{node1}, []*schedulingv1beta1.PodGroup{pg}, nil,
+		)
+		if err != nil {
+			t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+		}
+		schedCache := cache.New(ctx, nil, true, true)
+		schedCache.AddNode(klog.FromContext(ctx), node1)
+		schedCache.AddPodGroup(pg)
+		if err := schedCache.AddPod(klog.FromContext(ctx), unschedPod); err != nil {
+			t.Fatalf("schedCache.AddPod failed: %v", err)
+		}
+		if err := schedCache.UpdateSnapshot(klog.FromContext(ctx), snap); err != nil {
+			t.Fatalf("schedCache.UpdateSnapshot failed: %v", err)
+		}
+		cs := New(snap, profileMap)
+		placement, err := cs.MakePlacement([]string{"node1"})
+		if err != nil {
+			t.Fatalf("MakePlacement failed: %v", err)
+		}
+
+		schedRes, err := cs.SchedulePods(ctx, []*v1.Pod{unschedPod}, placement, SchedulePodsOptions{})
+		if err != nil || len(schedRes) != 1 || !schedRes[0].Status.IsSuccess() {
+			t.Fatalf("SchedulePods failed: err=%v res=%+v", err, schedRes)
+		}
+		assertScheduledPodsInPodGroupState(t, snap, "default", "basic-pg", map[string]string{"unsched-pod": "node1"})
+
+		if _, err := cs.PreemptPods(ctx, []*v1.Pod{schedRes[0].Pod}); err != nil {
+			t.Fatalf("PreemptPods failed: %v", err)
+		}
+		assertScheduledPodsInPodGroupState(t, snap, "default", "basic-pg", nil)
+
+		if err := cs.ResetMutations(); err != nil {
+			t.Fatalf("ResetMutations failed: %v", err)
+		}
+		assertScheduledPodsInPodGroupState(t, snap, "default", "basic-pg", nil)
+		pgState, err := snap.PodGroupStates().Get("default", "basic-pg")
+		if err != nil {
+			t.Fatalf("PodGroupStates().Get failed: %v", err)
+		}
+		var unschedNames []string
+		for _, p := range pgState.UnscheduledPods() {
+			unschedNames = append(unschedNames, p.Name)
+		}
+		if !slices.Equal(unschedNames, []string{"unsched-pod"}) {
+			t.Errorf("expected unsched-pod restored to UnscheduledPods(), got %v", unschedNames)
+		}
+	})
 }
