@@ -23,8 +23,16 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 )
 
+// UPSTREAM-DIFF: Declared as type aliases (`=`) until k8s.io/kube-scheduler 1.38
+// defines these interfaces in `fwk`. Because every leaf parameter and return type
+// belongs to k8s.io/* v0.37 or the Go standard library, type aliases allow
+// PodGroupPostFilter plugins outside this module (which cannot import this package
+// without a circular dependency) to type-assert PreemptionManager() on
+// *PreemptionFramework via an identical local structural interface.
+// Migration Plan (1.38): Delete pkg/upstreamsync/preemption and use fwk.PreemptionManager.
+
 // PreemptionManager is an interface that allows customization of the preemption logic.
-type PreemptionManager interface {
+type PreemptionManager = interface {
 	// GenerateVictims generates candidate victims for the PodGroup preemption.
 	// The preemption algorithm attempts to reprieve victims in reverse order, from last to first.
 	// The preemption algorithm will pass through unsuccessful status to the caller.
@@ -44,7 +52,7 @@ type PreemptionManager interface {
 
 // PreemptionVictim represents a preemption unit that abstracts individual Pods and PodGroups,
 // ensuring that atomic entities are treated as a single unit during eviction.
-type PreemptionVictim interface {
+type PreemptionVictim = interface {
 	// Pods returns the list of all Pods that belong to this preemption unit.
 	// Evicting this unit implies evicting all Pods in this list.
 	Pods() []fwk.PodInfo
@@ -55,7 +63,7 @@ type PreemptionVictim interface {
 }
 
 // PreemptionExecutor is an interface that provides preemption actuation and tracking operations.
-type PreemptionExecutor interface {
+type PreemptionExecutor = interface {
 	// IsPodRunningPreemption returns true if the pod is currently triggering preemption asynchronously.
 	IsPodRunningPreemption(podUID types.UID) bool
 	// IsPodGroupRunningPreemption returns true if the pod group is currently triggering preemption asynchronously.
@@ -70,7 +78,7 @@ type PreemptionExecutor interface {
 }
 
 // PreemptionCandidate represents the final set of victims that should be evicted for the preemptor to fit the node.
-type PreemptionCandidate interface {
+type PreemptionCandidate = interface {
 	// Victims wraps a list of to-be-preempted Pods and the number of PDB violations.
 	Victims() *extenderv1.Victims
 	// Name returns the target node name (or "cluster" for pod group preemption) where the preemptor gets nominated to run.
@@ -82,7 +90,7 @@ type PreemptionCandidate interface {
 }
 
 // ReprieveFilter controls whether candidate preemption victims can be reprieved during preemption evaluation.
-type ReprieveFilter interface {
+type ReprieveFilter = interface {
 	// ShouldAttemptReprieval is called before restoring the victim and running the fit check for the preemptor.
 	// If an error is returned, the preemption algorithm will abort evaluation without actuating preemption,
 	// and pass the error status to the caller.
